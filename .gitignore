@@ -39,4 +39,6 @@ Thumbs.db
 # 运行时生成的分析结果
 output/
 output_*/
+mo_output/
+single_*_output/
 test_output/

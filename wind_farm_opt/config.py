@@ -31,6 +31,44 @@ class OptimizationConfig:
 
 
 @dataclass
+class MultiObjectiveConfig:
+    """多目标优化配置。
+
+    未启用（``enabled=False``）时，原有单目标 GA/PSO 流程与输出结构
+    完全不变。
+
+    Attributes
+    ----------
+    enabled : bool
+        是否启用多目标（NSGA-II）模式
+    population_size : int
+        种群大小
+    max_generations : int
+        最大迭代代数
+    archive_size : int
+        外部 Pareto 存档容量上限
+    substation_xy : Optional[List[float]]
+        升压站坐标 [x, y] (m)；缺省时取场地顶点质心
+    cable_cost_per_km_wanyuan : float
+        集电线路单位造价 (万元/km)
+    preference_weights : dict
+        膝点方案的归一化偏好权重，键为
+        ``net_aep_mwh`` / ``lcoe_yuan_per_kwh`` / ``collection_length_m``
+    """
+    enabled: bool = False
+    population_size: int = 50
+    max_generations: int = 80
+    archive_size: int = 80
+    substation_xy: Optional[List[float]] = None
+    cable_cost_per_km_wanyuan: float = 35.0
+    preference_weights: dict = field(default_factory=lambda: {
+        "net_aep_mwh": 1.0,
+        "lcoe_yuan_per_kwh": 1.0,
+        "collection_length_m": 1.0,
+    })
+
+
+@dataclass
 class VisualizationConfig:
     """可视化配置。"""
     save_dir: str = "output"
@@ -72,6 +110,7 @@ class WindFarmConfig:
     })
 
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
+    multi_objective: MultiObjectiveConfig = field(default_factory=MultiObjectiveConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     economic: EconomicConfig = field(default_factory=EconomicConfig)
 
@@ -85,6 +124,12 @@ class WindFarmConfig:
         vis_config = VisualizationConfig(**data.get("visualization", {}))
         econ_config = EconomicConfig(**data.get("economic", {}))
 
+        mo_data = data.get("multi_objective", {})
+        mo_allowed = {f for f in MultiObjectiveConfig.__dataclass_fields__}
+        mo_config = MultiObjectiveConfig(
+            **{k: v for k, v in mo_data.items() if k in mo_allowed}
+        )
+
         return cls(
             n_turbines=data.get("n_turbines", 15),
             turbine_model=data.get("turbine_model", "V126-3.45MW"),
@@ -96,6 +141,7 @@ class WindFarmConfig:
             wind_resource_type=data.get("wind_resource_type", "default"),
             wind_resource_params=data.get("wind_resource_params", {}),
             optimization=opt_config,
+            multi_objective=mo_config,
             visualization=vis_config,
             economic=econ_config,
         )
@@ -113,6 +159,15 @@ class WindFarmConfig:
             "wind_resource_type": self.wind_resource_type,
             "wind_resource_params": self.wind_resource_params,
             "optimization": self.optimization.__dict__,
+            "multi_objective": {
+                "enabled": self.multi_objective.enabled,
+                "population_size": self.multi_objective.population_size,
+                "max_generations": self.multi_objective.max_generations,
+                "archive_size": self.multi_objective.archive_size,
+                "substation_xy": self.multi_objective.substation_xy,
+                "cable_cost_per_km_wanyuan": self.multi_objective.cable_cost_per_km_wanyuan,
+                "preference_weights": self.multi_objective.preference_weights,
+            },
             "visualization": self.visualization.__dict__,
             "economic": self.economic.__dict__,
         }

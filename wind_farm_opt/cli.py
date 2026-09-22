@@ -4,6 +4,7 @@
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -18,9 +19,19 @@ from .core.wind_resource import WindResource
 from .core.wake import WakeModel
 from .constraints.boundary import SiteBoundary
 from .farm.aep import AEPCalculator, FarmResult
+from .farm.collection import CollectionCostModel
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
 from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
+from .optimization.multiobjective import (
+    MultiObjectiveOptimizer,
+    MultiObjectiveResult,
+)
+from .optimization.objectives import (
+    OBJECTIVE_KEYS,
+    OBJECTIVE_LABELS,
+    MultiObjectiveEvaluator,
+)
 from .economy.costs import (
     EconomicAnalyzer,
     EconomicResult,
@@ -35,6 +46,12 @@ from .visualization.plotting import (
     plot_turbine_loss_bar,
     plot_comparison,
     plot_wake_heatmap,
+)
+from .visualization.multiobj_plot import (
+    plot_pareto_pairwise,
+    plot_pareto_parallel,
+    plot_pareto_convergence,
+    plot_collection_network,
 )
 
 
@@ -68,6 +85,7 @@ class WindFarmOptimizerCLI:
         self.optimize_result = None
         self.economic_result: Optional[EconomicResult] = None
         self.sweep_results: Optional[dict] = None
+        self.multi_objective_result: Optional[MultiObjectiveResult] = None
 
     def _setup_output_dir(self) -> None:
         """创建输出目录。"""
@@ -178,6 +196,105 @@ class WindFarmOptimizerCLI:
             print(f"  尾流损失减少: {loss_reduction:+.2f}%")
             print(f"  额外发电量:   {(self.optimized_result.net_aep - self.baseline_result.net_aep)/1e3:+.2f} GWh/年")
 
+    def run_multi_objective_optimization(self) -> None:
+        """运行 NSGA-II 多目标机位优化。"""
+        self._print_header("步骤 2/6: 执行多目标布局优化 (NSGA-II)")
+
+        mo_cfg = self.config.multi_objective
+
+        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        farm_cost = get_default_farm_cost()
+        farm_cost.discount_rate = self.config.economic.discount_rate
+        analyzer = EconomicAnalyzer(
+            turbine_cost=turbine_cost,
+            farm_cost=farm_cost,
+            electricity_price=self.config.economic.electricity_price,
+        )
+
+        substation_xy = (
+            np.asarray(mo_cfg.substation_xy, dtype=np.float64)
+            if mo_cfg.substation_xy is not None
+            else None
+        )
+
+        collection_cost_model = CollectionCostModel(
+            cable_cost_per_km_wanyuan=mo_cfg.cable_cost_per_km_wanyuan
+        )
+
+        evaluator = MultiObjectiveEvaluator(
+            aep_calculator=self.aep_calc,
+            economic_analyzer=analyzer,
+            n_turbines=self.config.n_turbines,
+            rated_power_per_turbine_MW=self.turbines[0].rated_power / 1e3,
+            boundary=self.boundary,
+            substation_xy=substation_xy,
+            collection_cost_model=collection_cost_model,
+        )
+
+        from .optimization.multiobjective import MultiObjectiveConfig as MOConfig
+
+        mo_alg_config = MOConfig(
+            population_size=mo_cfg.population_size,
+            max_generations=mo_cfg.max_generations,
+            archive_size=mo_cfg.archive_size,
+            min_spacing_multiple=self.config.optimization.min_spacing_multiple,
+            seed=self.config.optimization.seed,
+            preference_weights=mo_cfg.preference_weights,
+        )
+
+        optimizer = MultiObjectiveOptimizer(
+            n_turbines=self.config.n_turbines,
+            rotor_diameters=self.rotor_diameters,
+            boundary=self.boundary,
+            evaluator=evaluator,
+            config=mo_alg_config,
+            algorithm="nsga2",
+        )
+
+        self.multi_objective_result = optimizer.optimize(verbose=True)
+
+        # 膝点方案同时作为"优化后布局"，便于沿用既有经济性/对比输出。
+        knee = self.multi_objective_result.knee_solution
+        self.optimized_positions = knee.positions
+        self.optimized_result = self.aep_calc.compute_farm_aep(knee.positions)
+        # 单目标风格的收敛对象不再生成；optimize_result 保持 None，
+        # 避免误画单目标收敛曲线。
+
+        print("\n--- Pareto 解集摘要（按净AEP降序的确定性编号） ---")
+        print(f"  共 {len(self.multi_objective_result.solutions)} 个非支配方案")
+        print(f"  {'编号':>4} | {'净AEP(GWh)':>11} | {'LCOE(元/kWh)':>13} | "
+              f"{'集电线路(km)':>13}")
+        for s in self.multi_objective_result.solutions:
+            d = s.objectives.as_dict()
+            mark = " *膝点" if s.solution_id == knee.solution_id else ""
+            print(
+                f"  {s.solution_id:>4} | {d['net_aep_mwh']/1e3:11.2f} | "
+                f"{d['lcoe_yuan_per_kwh']:13.4f} | "
+                f"{d['collection_length_m']/1e3:13.2f}{mark}"
+            )
+
+        w = self.multi_objective_result.preference_weights
+        print(
+            "\n  膝点归一化偏好权重: "
+            f"AEP={w['net_aep_mwh']:.3f}, "
+            f"LCOE={w['lcoe_yuan_per_kwh']:.3f}, "
+            f"线路={w['collection_length_m']:.3f}（内部已归一化）"
+        )
+        print("\n--- 膝点方案全场评估 ---")
+        self._print_result_summary(self.optimized_result, "膝点布局")
+
+        if self.baseline_result is not None:
+            improvement = (
+                (self.optimized_result.net_aep - self.baseline_result.net_aep)
+                / self.baseline_result.net_aep * 100
+            )
+            print(f"\n--- 膝点方案相对基线 ---")
+            print(f"  发电量提升: {improvement:+.2f}%")
+            print(
+                f"  额外发电量: "
+                f"{(self.optimized_result.net_aep - self.baseline_result.net_aep)/1e3:+.2f} GWh/年"
+            )
+
     def run_economic_analysis(self) -> None:
         """运行经济性分析。"""
         if not self.config.economic.enable_analysis:
@@ -207,6 +324,17 @@ class WindFarmOptimizerCLI:
             rated_power_per_turbine_MW=rated_power_MW,
             net_aep_GWh=result.net_aep / 1e3,
         )
+
+        # 多目标模式：用膝点方案的集电网络投资修正总投资与 LCOE，
+        # 使评审打印与 Pareto 目标值完全一致。
+        if self.multi_objective_result is not None:
+            knee_obj = self.multi_objective_result.knee_solution.objectives
+            self.economic_result.total_capital_cost = (
+                knee_obj.total_capital_cost_wanyuan
+            )
+            self.economic_result.lcoe = knee_obj.lcoe_yuan_per_kwh
+            collection_cost = knee_obj.collection_cost_wanyuan
+            self.economic_result.cost_breakdown["集电系统"] = float(collection_cost)
 
         print(f"\n--- 经济性分析结果（基于优化后布局） ---")
         print(f"  上网电价:      {self.config.economic.electricity_price:.2f} 元/kWh")
@@ -395,6 +523,33 @@ class WindFarmOptimizerCLI:
                 show=show,
             )
 
+        if self.multi_objective_result is not None:
+            mo = self.multi_objective_result
+            plot_pareto_pairwise(
+                result=mo,
+                title="Pareto 非支配解集 - 净AEP / LCOE / 集电线路长度",
+                save_path=os.path.join(save_dir, "pareto_pairwise.png") if save else None,
+                show=show,
+            )
+            plot_pareto_parallel(
+                result=mo,
+                save_path=os.path.join(save_dir, "pareto_parallel.png") if save else None,
+                show=show,
+            )
+            plot_pareto_convergence(
+                result=mo,
+                save_path=os.path.join(save_dir, "pareto_convergence.png") if save else None,
+                show=show,
+            )
+            plot_collection_network(
+                solution=mo.knee_solution,
+                boundary=self.boundary,
+                rotor_diameters=self.rotor_diameters,
+                title=f"膝点方案 {mo.knee_solution.solution_id} 集电网络布局",
+                save_path=os.path.join(save_dir, "knee_collection_network.png") if save else None,
+                show=show,
+            )
+
     def save_results(self) -> None:
         """保存所有结果到JSON文件。"""
         self._print_header("步骤 6/6: 保存结果数据")
@@ -480,15 +635,119 @@ class WindFarmOptimizerCLI:
                 "lcoe_yuan_per_kwh": self.sweep_results["lcoe"],
             }
 
+        if self.multi_objective_result is not None:
+            results["multi_objective"] = self._build_multi_objective_summary()
+
         results_path = os.path.join(output_dir, "results.json")
         with open(results_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
+
+        if self.multi_objective_result is not None:
+            self._save_pareto_files(output_dir)
 
         config_path = os.path.join(output_dir, "config.json")
         self.config.to_json(config_path)
 
         print(f"结果已保存到: {os.path.abspath(results_path)}")
+        if self.multi_objective_result is not None:
+            print(f"Pareto 方案已保存到: {os.path.abspath(os.path.join(output_dir, 'pareto_front.json'))}")
+            print(f"Pareto 目标表已保存到: {os.path.abspath(os.path.join(output_dir, 'pareto_front.csv'))}")
         print(f"配置已保存到: {os.path.abspath(config_path)}")
+
+    def _build_multi_objective_summary(self) -> dict:
+        """构建 results.json 中的多目标摘要（完整方案另存 pareto_front.json）。"""
+        mo = self.multi_objective_result
+
+        extremes: dict[str, dict] = {}
+        solutions = mo.solutions
+        for m, key in enumerate(OBJECTIVE_KEYS):
+            vals = [s.objective_vector()[m] for s in solutions]
+            d = mo.objective_directions[key]
+            if d > 0:
+                best_sol = max(solutions, key=lambda s, m=m: s.objective_vector()[m])
+                best_value, worst_value = max(vals), min(vals)
+            else:
+                best_sol = min(solutions, key=lambda s, m=m: s.objective_vector()[m])
+                best_value, worst_value = min(vals), max(vals)
+            extremes[key] = {
+                "label": OBJECTIVE_LABELS[key],
+                "direction": "maximize" if d > 0 else "minimize",
+                "best_solution_id": best_sol.solution_id,
+                "best_value": float(best_value),
+                "worst_value": float(worst_value),
+            }
+
+        return {
+            "algorithm": mo.algorithm,
+            "seed": mo.seed,
+            "objective_keys": list(mo.objective_keys),
+            "objective_labels": mo.objective_labels,
+            "objective_directions": mo.objective_directions,
+            "objective_units": {
+                "net_aep_mwh": "MWh/year",
+                "lcoe_yuan_per_kwh": "CNY/kWh",
+                "collection_length_m": "m",
+            },
+            "substation_xy": mo.substation_xy.tolist(),
+            "n_solutions": len(solutions),
+            "preference_weights": mo.preference_weights,
+            "normalization": mo.normalization,
+            "knee_solution_id": mo.knee_solution.solution_id,
+            "knee_objectives": mo.knee_solution.objectives.as_dict(),
+            "objective_extremes": extremes,
+            "convergence_history": mo.convergence_history,
+            "solutions_file": "pareto_front.json",
+            "solutions_csv": "pareto_front.csv",
+        }
+
+    def _save_pareto_files(self, output_dir: str) -> None:
+        """保存完整 Pareto 解集（JSON 含机位/网络明细，CSV 为目标表）。"""
+        mo = self.multi_objective_result
+
+        payload = {
+            "algorithm": mo.algorithm,
+            "seed": mo.seed,
+            "objective_keys": list(mo.objective_keys),
+            "objective_labels": mo.objective_labels,
+            "objective_directions": mo.objective_directions,
+            "preference_weights": mo.preference_weights,
+            "normalization": mo.normalization,
+            "substation_xy": mo.substation_xy.tolist(),
+            "knee_solution_id": mo.knee_solution.solution_id,
+            "solutions": [s.to_dict() for s in mo.solutions],
+        }
+
+        pareto_json = os.path.join(output_dir, "pareto_front.json")
+        with open(pareto_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+        pareto_csv = os.path.join(output_dir, "pareto_front.csv")
+        with open(pareto_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "solution_id", "is_knee",
+                "net_aep_mwh", "lcoe_yuan_per_kwh", "collection_length_m",
+                "collection_cost_wanyuan", "total_capital_cost_wanyuan",
+                "crowding_distance",
+            ])
+            knee_id = mo.knee_solution.solution_id
+            for s in mo.solutions:
+                d = s.objectives.as_dict()
+                crowd_str = (
+                    f"{s.crowding_distance:.6f}"
+                    if np.isfinite(s.crowding_distance)
+                    else ""
+                )
+                writer.writerow([
+                    s.solution_id,
+                    int(s.solution_id == knee_id),
+                    f"{d['net_aep_mwh']:.6f}",
+                    f"{d['lcoe_yuan_per_kwh']:.8f}",
+                    f"{d['collection_length_m']:.6f}",
+                    f"{s.objectives.collection_cost_wanyuan:.4f}",
+                    f"{s.objectives.total_capital_cost_wanyuan:.4f}",
+                    crowd_str,
+                ])
 
     def run_full_analysis(
         self,
@@ -507,12 +766,16 @@ class WindFarmOptimizerCLI:
         print(f"  尾流模型: {self.config.wake_model}")
         print(f"  平均风速: {self.wind_resource.overall_mean_speed:.2f} m/s")
         print(f"  场地面积: {self.boundary.area / 1e6:.2f} km²")
+        print(f"  优化模式: {'多目标 NSGA-II（净AEP/LCOE/集电线路）' if self.config.multi_objective.enabled else f'单目标 {self.config.optimization.algorithm.upper()}（净AEP）'}")
 
         if run_baseline:
             self.run_baseline()
 
         if run_opt:
-            self.run_optimization()
+            if self.config.multi_objective.enabled:
+                self.run_multi_objective_optimization()
+            else:
+                self.run_optimization()
 
         if run_econ:
             self.run_economic_analysis()
@@ -654,6 +917,75 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--multi-objective",
+        action="store_true",
+        help="启用多目标模式：同时优化净AEP、LCOE与集电线路长度 (NSGA-II)",
+    )
+
+    parser.add_argument(
+        "--mo-population",
+        type=int,
+        default=None,
+        help="多目标模式种群大小",
+    )
+
+    parser.add_argument(
+        "--mo-generations",
+        type=int,
+        default=None,
+        help="多目标模式最大迭代代数",
+    )
+
+    parser.add_argument(
+        "--archive-size",
+        type=int,
+        default=None,
+        help="多目标 Pareto 外部存档容量上限",
+    )
+
+    parser.add_argument(
+        "--substation-x",
+        type=float,
+        default=None,
+        help="升压站X坐标 (m)，缺省取场地顶点质心",
+    )
+
+    parser.add_argument(
+        "--substation-y",
+        type=float,
+        default=None,
+        help="升压站Y坐标 (m)，缺省取场地顶点质心",
+    )
+
+    parser.add_argument(
+        "--cable-cost",
+        type=float,
+        default=None,
+        help="集电线路单位造价 (万元/km)",
+    )
+
+    parser.add_argument(
+        "--prefer-aep",
+        type=float,
+        default=None,
+        help="膝点选择中净AEP的归一化偏好权重（默认1.0）",
+    )
+
+    parser.add_argument(
+        "--prefer-lcoe",
+        type=float,
+        default=None,
+        help="膝点选择中LCOE的归一化偏好权重（默认1.0）",
+    )
+
+    parser.add_argument(
+        "--prefer-cable",
+        type=float,
+        default=None,
+        help="膝点选择中集电线路长度的归一化偏好权重（默认1.0）",
+    )
+
+    parser.add_argument(
         "--no-economic",
         action="store_true",
         help="跳过经济性分析",
@@ -781,6 +1113,30 @@ def main() -> int:
         config.visualization.show_plots = True
     if args.no_economic:
         config.economic.enable_analysis = False
+
+    if args.multi_objective:
+        config.multi_objective.enabled = True
+    if args.mo_population is not None:
+        config.multi_objective.population_size = args.mo_population
+    if args.mo_generations is not None:
+        config.multi_objective.max_generations = args.mo_generations
+    if args.archive_size is not None:
+        config.multi_objective.archive_size = args.archive_size
+    if args.substation_x is not None:
+        config.multi_objective.substation_xy = [
+            args.substation_x,
+            args.substation_y if args.substation_y is not None else args.substation_x * 0.0,
+        ]
+    elif args.substation_y is not None:
+        config.multi_objective.substation_xy = [0.0, args.substation_y]
+    if args.cable_cost is not None:
+        config.multi_objective.cable_cost_per_km_wanyuan = args.cable_cost
+    if args.prefer_aep is not None:
+        config.multi_objective.preference_weights["net_aep_mwh"] = args.prefer_aep
+    if args.prefer_lcoe is not None:
+        config.multi_objective.preference_weights["lcoe_yuan_per_kwh"] = args.prefer_lcoe
+    if args.prefer_cable is not None:
+        config.multi_objective.preference_weights["collection_length_m"] = args.prefer_cable
 
     cli = WindFarmOptimizerCLI(config)
     cli._min_turbines = args.min_turbines

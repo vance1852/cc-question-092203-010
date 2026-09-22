@@ -163,7 +163,85 @@ if econ_result.payback_period:
 if econ_result.irr:
     print(f"   ✓ 内部收益率: {econ_result.irr:.2f}%")
 
-print("\n9. 测试可视化模块...")
+print("\n9. 测试多目标优化（NSGA-II：净AEP/LCOE/集电线路）...")
+from wind_farm_opt.optimization.objectives import MultiObjectiveEvaluator
+from wind_farm_opt.optimization.multiobjective import (
+    MultiObjectiveOptimizer,
+    MultiObjectiveConfig as MOAlgConfig,
+)
+from wind_farm_opt.farm.collection import (
+    estimate_collection_network,
+    CollectionCostModel,
+)
+
+# 9.1 集电网络 MST 估算
+substation = np.array([0.0, 0.0])
+network = estimate_collection_network(positions, substation)
+assert len(network.edges) == n_turb, "MST 边数应为机位台数（含升压站共 N+1 节点）"
+assert network.total_length_m > 0
+print(f"   ✓ 集电线路(MST)总长度: {network.total_length_m/1e3:.2f} km，边数: {len(network.edges)}")
+
+# 9.2 小规模 NSGA-II
+mo_evaluator = MultiObjectiveEvaluator(
+    aep_calculator=aep_calc,
+    economic_analyzer=analyzer,
+    n_turbines=n_turb,
+    rated_power_per_turbine_MW=turb.rated_power/1e3,
+    boundary=boundary,
+    substation_xy=substation,
+    collection_cost_model=CollectionCostModel(),
+)
+mo_config = MOAlgConfig(
+    population_size=10,
+    max_generations=4,
+    archive_size=15,
+    min_spacing_multiple=5.0,
+    seed=42,
+)
+mo_optimizer = MultiObjectiveOptimizer(
+    n_turbines=n_turb,
+    rotor_diameters=rotor_diameters,
+    boundary=boundary,
+    evaluator=mo_evaluator,
+    config=mo_config,
+)
+mo_result = mo_optimizer.optimize(verbose=False)
+print(f"   ✓ Pareto 非支配解数量: {len(mo_result.solutions)}")
+assert len(mo_result.solutions) >= 2
+
+# 9.3 确定性复现：相同种子得到相同的编号-目标序列
+mo_result_2 = MultiObjectiveOptimizer(
+    n_turbines=n_turb,
+    rotor_diameters=rotor_diameters,
+    boundary=boundary,
+    evaluator=mo_evaluator,
+    config=MOAlgConfig(population_size=10, max_generations=4, archive_size=15,
+                       min_spacing_multiple=5.0, seed=42),
+).optimize(verbose=False)
+v1 = np.array([s.objective_vector() for s in mo_result.solutions])
+v2 = np.array([s.objective_vector() for s in mo_result_2.solutions])
+assert v1.shape == v2.shape and np.allclose(v1, v2), "相同种子应稳定复现 Pareto 排序"
+assert [s.solution_id for s in mo_result.solutions] == [s.solution_id for s in mo_result_2.solutions]
+assert mo_result.knee_solution.solution_id == mo_result_2.knee_solution.solution_id
+print(f"   ✓ 重复种子稳定复现编号与排序，膝点: {mo_result.knee_solution.solution_id}")
+
+# 9.4 偏好权重改变膝点选择
+from wind_farm_opt.optimization.multiobjective import select_knee_solution
+k_cable, _ = select_knee_solution(mo_result.solutions, {
+    "net_aep_mwh": 1.0, "lcoe_yuan_per_kwh": 1.0, "collection_length_m": 10.0,
+})
+k_aep, _ = select_knee_solution(mo_result.solutions, {
+    "net_aep_mwh": 10.0, "lcoe_yuan_per_kwh": 1.0, "collection_length_m": 1.0,
+})
+print(f"   ✓ 偏好线路时膝点: {k_cable.solution_id}，偏好AEP时膝点: {k_aep.solution_id}")
+
+for s in mo_result.solutions:
+    d = s.objectives.as_dict()
+    mark = " (膝点)" if s.solution_id == mo_result.knee_solution.solution_id else ""
+    print(f"     {s.solution_id}: AEP={d['net_aep_mwh']/1e3:6.2f} GWh, "
+          f"LCOE={d['lcoe_yuan_per_kwh']:.4f}, 线路={d['collection_length_m']/1e3:6.2f} km{mark}")
+
+print("\n10. 测试可视化模块...")
 from wind_farm_opt.visualization.plotting import (
     plot_farm_layout,
     plot_wind_rose,
@@ -200,6 +278,21 @@ plot_turbine_loss_bar(
     show=False,
 )
 print("   ✓ 损失柱状图已生成")
+
+from wind_farm_opt.visualization.multiobj_plot import (
+    plot_pareto_pairwise,
+    plot_pareto_parallel,
+    plot_collection_network,
+    plot_pareto_convergence,
+)
+plot_pareto_pairwise(mo_result, save_path="test_output/pareto_pairwise.png", show=False)
+plot_pareto_parallel(mo_result, save_path="test_output/pareto_parallel.png", show=False)
+plot_collection_network(
+    mo_result.knee_solution, boundary, rotor_diameters,
+    save_path="test_output/knee_collection_network.png", show=False,
+)
+plot_pareto_convergence(mo_result, save_path="test_output/pareto_convergence.png", show=False)
+print("   ✓ 多目标 Pareto 图表已生成")
 
 print("\n" + "=" * 60)
 print("所有核心测试通过! ✓")
