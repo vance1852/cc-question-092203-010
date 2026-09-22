@@ -201,6 +201,106 @@ plot_turbine_loss_bar(
 )
 print("   ✓ 损失柱状图已生成")
 
+print("\n10. 测试多目标 Pareto 优化（净AEP / LCOE / 集电线路长度）...")
+from wind_farm_opt.economy.cable import estimate_cable_network
+from wind_farm_opt.optimization.multi_objective import (
+    LayoutMultiObjectiveEvaluator,
+    MultiObjectiveConfig,
+    run_multi_objective,
+)
+from wind_farm_opt.economy.costs import EconomicAnalyzer, get_default_turbine_cost, get_default_farm_cost
+from wind_farm_opt.visualization.pareto import (
+    plot_pareto_front,
+    plot_pareto_parallel,
+    plot_solution_network,
+)
+
+# 10a. 集电网络 MST
+net = estimate_cable_network(positions)
+assert len(net.edges) == n_turb, "MST 边数应为节点数-1（含升压站共 N+1 节点）"
+assert net.total_length > 0
+print(f"   ✓ 集电网络(MST): 总长度 {net.total_length/1e3:.2f} km，边数 {len(net.edges)}")
+
+# 10b. 小规模 NSGA-II
+turb_cost2 = get_default_turbine_cost("V126-3.45MW")
+farm_cost2 = get_default_farm_cost()
+analyzer2 = EconomicAnalyzer(turb_cost2, farm_cost2, electricity_price=0.45)
+rated_MW = turb.rated_power / 1e3
+capital_cost, _ = analyzer2.compute_capital_cost(n_turb, rated_MW)
+om_cost = analyzer2.compute_annual_om_cost(n_turb, rated_MW)
+
+evaluator = LayoutMultiObjectiveEvaluator(
+    aep_evaluate_fn=aep_calc.evaluate_layout,
+    capital_cost=capital_cost,
+    om_cost_annual=om_cost,
+    lcoe_fn=analyzer2.compute_lcoe,
+)
+mo_config = MultiObjectiveConfig(
+    algorithm="nsga2",
+    population_size=10,
+    max_iterations=4,
+    archive_size=10,
+    min_spacing_multiple=5.0,
+    seed=42,
+)
+mo_result = run_multi_objective(
+    n_turbines=n_turb,
+    rotor_diameters=rotor_diameters,
+    boundary=boundary,
+    evaluator=evaluator,
+    config=mo_config,
+    verbose=False,
+)
+
+# 非支配性校验
+import numpy as _np
+F = _np.array([[-s.objectives.net_aep_mwh, s.objectives.lcoe, s.objectives.cable_length_m]
+               for s in mo_result.solutions])
+for _i in range(len(F)):
+    for _j in range(len(F)):
+        if _i == _j:
+            continue
+        assert not (_np.all(F[_i] <= F[_j] + 1e-9) and _np.any(F[_i] < F[_j] - 1e-9)), \
+            "Pareto 解集中存在支配关系"
+
+# 编号与膝点校验
+ids = [s.solution_id for s in mo_result.solutions]
+assert ids == [f"P{k:02d}" for k in range(len(ids))]
+knee_scores = [s.weighted_score for s in mo_result.solutions]
+assert mo_result.knee_solution.solution_id == ids[int(_np.argmin(knee_scores))]
+knee = mo_result.knee_solution
+print(f"   ✓ NSGA-II 得到 {len(mo_result.solutions)} 个非支配解，膝点 {knee.solution_id}")
+print(f"     膝点: 净AEP {knee.objectives.net_aep_gwh:.2f} GWh, "
+      f"LCOE {knee.objectives.lcoe:.3f}, 线缆 {knee.objectives.cable_length_m/1e3:.2f} km")
+
+# 10c. 种子可复现
+mo_config2 = MultiObjectiveConfig(
+    algorithm="nsga2", population_size=10, max_iterations=4, archive_size=10,
+    min_spacing_multiple=5.0, seed=42,
+)
+evaluator2 = LayoutMultiObjectiveEvaluator(
+    aep_evaluate_fn=aep_calc.evaluate_layout,
+    capital_cost=capital_cost, om_cost_annual=om_cost, lcoe_fn=analyzer2.compute_lcoe,
+)
+mo_result2 = run_multi_objective(
+    n_turb, rotor_diameters, boundary, evaluator2, mo_config2, verbose=False,
+)
+assert len(mo_result2.solutions) == len(mo_result.solutions)
+for s1, s2 in zip(mo_result.solutions, mo_result2.solutions):
+    assert s1.solution_id == s2.solution_id
+    assert _np.allclose(s1.positions, s2.positions)
+    assert s1.objectives == s2.objectives
+print("   ✓ 相同种子排序/机位/目标稳定复现")
+
+# 10d. Pareto 图表
+plot_pareto_front(mo_result, save_path="test_output/pareto_front.png", show=False)
+plot_pareto_parallel(mo_result, save_path="test_output/pareto_parallel.png", show=False)
+plot_solution_network(
+    knee, boundary, rotor_diameters,
+    save_path="test_output/knee_network.png", show=False,
+)
+print("   ✓ Pareto 前沿图/平行坐标图/膝点网络图已生成")
+
 print("\n" + "=" * 60)
 print("所有核心测试通过! ✓")
 print("=" * 60)

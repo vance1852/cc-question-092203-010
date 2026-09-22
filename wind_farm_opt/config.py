@@ -31,6 +31,40 @@ class OptimizationConfig:
 
 
 @dataclass
+class MultiObjectiveConfig:
+    """多目标优化配置。
+
+    enabled 为 False（默认）时系统保持原单目标行为，该配置下其余字段
+    不会被使用。
+
+    knee_weights 为膝点（折中）方案的归一化偏好权重，只需给出相对大小：
+    aep（净AEP）、lcoe（度电成本）、cable（集电线路长度）。
+    """
+    enabled: bool = False
+    algorithm: str = "nsga2"
+    population_size: int = 40
+    max_iterations: int = 60
+    archive_size: Optional[int] = 40
+    min_spacing_multiple: float = 5.0
+    seed: Optional[int] = 42
+    knee_weights: dict = field(default_factory=lambda: {
+        "aep": 1.0,
+        "lcoe": 1.0,
+        "cable": 1.0,
+    })
+    substation_position: Optional[List[float]] = None
+    cable_cost_per_km: float = 80.0
+    crossover_rate: float = 0.8
+    mutation_rate: float = 0.15
+    mutation_strength: float = 0.1
+    inertia_weight: float = 0.7
+    cognitive_coeff: float = 1.49
+    social_coeff: float = 1.49
+    max_velocity: float = 0.2
+    turbulence_rate: float = 0.1
+
+
+@dataclass
 class VisualizationConfig:
     """可视化配置。"""
     save_dir: str = "output"
@@ -72,6 +106,7 @@ class WindFarmConfig:
     })
 
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
+    multi_objective: MultiObjectiveConfig = field(default_factory=MultiObjectiveConfig)
     visualization: VisualizationConfig = field(default_factory=VisualizationConfig)
     economic: EconomicConfig = field(default_factory=EconomicConfig)
 
@@ -82,6 +117,8 @@ class WindFarmConfig:
             data = json.load(f)
 
         opt_config = OptimizationConfig(**data.get("optimization", {}))
+        mo_data = data.get("multi_objective", {})
+        mo_config = MultiObjectiveConfig(**mo_data)
         vis_config = VisualizationConfig(**data.get("visualization", {}))
         econ_config = EconomicConfig(**data.get("economic", {}))
 
@@ -96,6 +133,7 @@ class WindFarmConfig:
             wind_resource_type=data.get("wind_resource_type", "default"),
             wind_resource_params=data.get("wind_resource_params", {}),
             optimization=opt_config,
+            multi_objective=mo_config,
             visualization=vis_config,
             economic=econ_config,
         )
@@ -113,6 +151,7 @@ class WindFarmConfig:
             "wind_resource_type": self.wind_resource_type,
             "wind_resource_params": self.wind_resource_params,
             "optimization": self.optimization.__dict__,
+            "multi_objective": self.multi_objective.__dict__,
             "visualization": self.visualization.__dict__,
             "economic": self.economic.__dict__,
         }
